@@ -56,7 +56,10 @@ function App() {
     formData.append('image', selectedFile);
 
     try {
-      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+      let apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+      if (apiUrl.endsWith('/api')) {
+        apiUrl = apiUrl.slice(0, -4);
+      }
       const response = await axios.post(`${apiUrl}/api/remove-watermark`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         responseType: 'blob',
