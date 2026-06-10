@@ -13,16 +13,33 @@ const processImage = async (req, res) => {
         // Get image metadata
         const metadata = await sharp(inputBuffer).metadata();
 
-        // Crop the bottom 4% of the image to remove the DALL-E watermark
-        const cropHeight = Math.floor(metadata.height * 0.96);
+        // DALL-E watermark is typically in the bottom right corner.
+        // Instead of cropping the entire bottom (which cuts off text),
+        // we'll clone a patch from just above the watermark and paste it over the watermark.
+        const watermarkWidth = Math.floor(metadata.width * 0.12);
+        const watermarkHeight = Math.floor(metadata.height * 0.04);
+        
+        const topBoundary = Math.max(0, metadata.height - (watermarkHeight * 2));
+        
+        // Extract a patch directly above the watermark
+        const patch = await sharp(inputBuffer)
+            .extract({
+                left: metadata.width - watermarkWidth,
+                top: topBoundary,
+                width: watermarkWidth,
+                height: watermarkHeight
+            })
+            .blur(1) // Slight blur for better blending
+            .toBuffer();
 
         const processedBuffer = await sharp(inputBuffer)
-            .extract({
-                left: 0,
-                top: 0,
-                width: metadata.width,
-                height: cropHeight
-            })
+            .composite([
+                {
+                    input: patch,
+                    top: metadata.height - watermarkHeight,
+                    left: metadata.width - watermarkWidth
+                }
+            ])
             .toFormat(metadata.format || 'png')
             .toBuffer();
 
