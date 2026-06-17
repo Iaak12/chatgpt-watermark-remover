@@ -39,6 +39,7 @@ const processImage = async (req, res) => {
                     left: metadata.width - watermarkWidth
                 }
             ])
+            .withMetadata() // Preserve original DPI, EXIF, and orientation
             .toFormat(metadata.format || 'png')
             .toBuffer();
 
