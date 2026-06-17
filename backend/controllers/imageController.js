@@ -13,11 +13,10 @@ const processImage = async (req, res) => {
         // Get image metadata
         const metadata = await sharp(inputBuffer).metadata();
 
-        // DALL-E watermark is typically in the bottom right corner.
-        // Instead of cropping the entire bottom (which cuts off text),
-        // we'll clone a patch from just above the watermark and paste it over the watermark.
-        const watermarkWidth = Math.floor(metadata.width * 0.12);
-        const watermarkHeight = Math.floor(metadata.height * 0.04);
+        // DALL-E watermark is very small in the bottom right corner.
+        // Using precise dimensions (approx 5.5% width, 1.8% height) to avoid cutting off text.
+        const watermarkWidth = Math.floor(metadata.width * 0.055);
+        const watermarkHeight = Math.floor(metadata.height * 0.018);
         
         const topBoundary = Math.max(0, metadata.height - (watermarkHeight * 2));
         
@@ -29,7 +28,7 @@ const processImage = async (req, res) => {
                 width: watermarkWidth,
                 height: watermarkHeight
             })
-            .blur(1) // Slight blur for better blending
+            .blur(3) // Stronger blur to blend out any copied text into a solid color
             .toBuffer();
 
         const processedBuffer = await sharp(inputBuffer)
