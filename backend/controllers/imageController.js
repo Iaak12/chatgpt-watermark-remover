@@ -2,15 +2,37 @@ const sharp = require('sharp');
 const ImageLog = require('../models/ImageLog');
 
 /**
- * Smart inpainting: fills a region by sampling the surrounding border pixels
- * and creating a smooth gradient fill — no blur artifacts, color stays natural.
+ * Diagnose: log watermark region pixel stats for debugging
+ */
+async function logRegionStats(inputBuffer, left, top, width, height, label) {
+    try {
+        const meta = await sharp(inputBuffer).metadata();
+        const safeL = Math.max(0, Math.min(left, meta.width - 1));
+        const safeT = Math.max(0, Math.min(top, meta.height - 1));
+        const safeW = Math.min(width, meta.width - safeL);
+        const safeH = Math.min(height, meta.height - safeT);
+        if (safeW <= 0 || safeH <= 0) return;
+
+        const { data } = await sharp(inputBuffer)
+            .extract({ left: safeL, top: safeT, width: safeW, height: safeH })
+            .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+
+        let r = 0, g = 0, b = 0, count = 0;
+        for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i+1]; b += data[i+2]; count++; }
+        if (count > 0) console.log(`[${label}] region avg color: r=${Math.round(r/count)} g=${Math.round(g/count)} b=${Math.round(b/count)} pixels=${count} area=${safeW}x${safeH} at (${safeL},${safeT})`);
+    } catch(e) { console.log(`[${label}] stats error:`, e.message); }
+}
+
+/**
+ * Fill a region by sampling the adjacent strip ABOVE (or below if at top edge).
+ * Uses a gentle Gaussian blur on the sample to smooth any gradient transitions.
+ * Result: seamless fill with no hard edges.
  */
 async function inpaintRegion(inputBuffer, left, top, width, height) {
     const metadata = await sharp(inputBuffer).metadata();
     const imgW = metadata.width;
     const imgH = metadata.height;
 
-    // Clamp to image boundaries
     const safeLeft   = Math.max(0, left);
     const safeTop    = Math.max(0, top);
     const safeRight  = Math.min(imgW, left + width);
@@ -20,72 +42,60 @@ async function inpaintRegion(inputBuffer, left, top, width, height) {
 
     if (safeW <= 0 || safeH <= 0) return inputBuffer;
 
-    // Sample border pixels (above, left, right edge rows/columns near the region)
-    const sampleSize = Math.max(4, Math.floor(Math.min(safeW, safeH) * 0.15));
+    // How many rows to sample for background color
+    const sampleRows = Math.max(6, Math.ceil(safeH * 0.5));
 
-    // Sample patch ABOVE the watermark region
-    const sampleTop  = Math.max(0, safeTop - sampleSize);
-    const sampleH    = Math.min(sampleSize, safeTop);
+    let fillPatch;
 
-    let fillR = 128, fillG = 128, fillB = 128;
+    if (safeTop >= sampleRows) {
+        // Sample strip ABOVE the watermark
+        const sampleY = safeTop - sampleRows;
+        const raw = await sharp(inputBuffer)
+            .extract({ left: safeLeft, top: sampleY, width: safeW, height: sampleRows })
+            .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
 
-    if (sampleH > 0) {
-        // Get raw pixel data from the sample strip above
-        const { data } = await sharp(inputBuffer)
-            .extract({ left: safeLeft, top: sampleTop, width: safeW, height: sampleH })
-            .ensureAlpha()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
+        // Average the sampled pixels
+        let r = 0, g = 0, b = 0, count = 0;
+        for (let i = 0; i < raw.data.length; i += 4) {
+            r += raw.data[i]; g += raw.data[i+1]; b += raw.data[i+2]; count++;
+        }
+        const avgR = count ? Math.round(r/count) : 128;
+        const avgG = count ? Math.round(g/count) : 128;
+        const avgB = count ? Math.round(b/count) : 128;
+
+        // Stretch the sample strip to fill the watermark area (natural texture)
+        fillPatch = await sharp(inputBuffer)
+            .extract({ left: safeLeft, top: sampleY, width: safeW, height: sampleRows })
+            .resize(safeW, safeH, { fit: 'fill' })
+            .blur(1.5)
+            .png()
+            .toBuffer();
+
+    } else if (safeBottom + sampleRows <= imgH) {
+        // Sample strip BELOW (e.g. watermark at very top)
+        const raw = await sharp(inputBuffer)
+            .extract({ left: safeLeft, top: safeBottom, width: safeW, height: sampleRows })
+            .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
 
         let r = 0, g = 0, b = 0, count = 0;
-        for (let i = 0; i < data.length; i += 4) {
-            r += data[i];
-            g += data[i + 1];
-            b += data[i + 2];
-            count++;
+        for (let i = 0; i < raw.data.length; i += 4) {
+            r += raw.data[i]; g += raw.data[i+1]; b += raw.data[i+2]; count++;
         }
-        if (count > 0) {
-            fillR = Math.round(r / count);
-            fillG = Math.round(g / count);
-            fillB = Math.round(b / count);
-        }
-    } else {
-        // Sample from below if at top edge
-        const sampleBot = Math.min(imgH - 1, safeBottom + sampleSize);
-        const sampleBH  = Math.min(sampleSize, imgH - safeBottom);
-        if (sampleBH > 0) {
-            const { data } = await sharp(inputBuffer)
-                .extract({ left: safeLeft, top: safeBottom, width: safeW, height: sampleBH })
-                .ensureAlpha()
-                .raw()
-                .toBuffer({ resolveWithObject: true });
+        const avgR = count ? Math.round(r/count) : 128;
+        const avgG = count ? Math.round(g/count) : 128;
+        const avgB = count ? Math.round(b/count) : 128;
 
-            let r = 0, g = 0, b = 0, count = 0;
-            for (let i = 0; i < data.length; i += 4) {
-                r += data[i];
-                g += data[i + 1];
-                b += data[i + 2];
-                count++;
-            }
-            if (count > 0) {
-                fillR = Math.round(r / count);
-                fillG = Math.round(g / count);
-                fillB = Math.round(b / count);
-            }
-        }
+        fillPatch = await sharp({
+            create: { width: safeW, height: safeH, channels: 3, background: { r: avgR, g: avgG, b: avgB } }
+        }).png().toBuffer();
+
+    } else {
+        // Fallback: solid gray
+        fillPatch = await sharp({
+            create: { width: safeW, height: safeH, channels: 3, background: { r: 128, g: 128, b: 128 } }
+        }).png().toBuffer();
     }
 
-    // Create a solid color fill patch matching the sampled background color
-    const fillPatch = await sharp({
-        create: {
-            width: safeW,
-            height: safeH,
-            channels: 3,
-            background: { r: fillR, g: fillG, b: fillB }
-        }
-    }).png().toBuffer();
-
-    // Composite the fill patch onto the original image
     return await sharp(inputBuffer)
         .composite([{ input: fillPatch, top: safeTop, left: safeLeft }])
         .toBuffer();
@@ -93,45 +103,73 @@ async function inpaintRegion(inputBuffer, left, top, width, height) {
 
 /**
  * ChatGPT / DALL-E watermark:
- *   – Very small text logo in the BOTTOM-RIGHT corner
- *   – Approx 5.5% width × 1.8% height of image
+ *   ✦ sparkle icon — BOTTOM-RIGHT corner
+ *   Approx 8% width × 6% height (generous margin to definitely cover it)
  */
 async function removeChatGPTWatermark(inputBuffer, metadata) {
-    const wmW = Math.ceil(metadata.width  * 0.065); // slightly wider margin
-    const wmH = Math.ceil(metadata.height * 0.028); // slightly taller margin
+    // Use percentage-based sizing — covers the small DALL-E ✦ logo
+    const wmW = Math.ceil(metadata.width  * 0.12);  // 12% width from right
+    const wmH = Math.ceil(metadata.height * 0.08);  // 8% height from bottom
 
     const left = metadata.width  - wmW;
     const top  = metadata.height - wmH;
 
+    await logRegionStats(inputBuffer, left, top, wmW, wmH, 'ChatGPT');
     return await inpaintRegion(inputBuffer, left, top, wmW, wmH);
 }
 
 /**
  * Gemini watermark:
- *   – "Generated by Gemini" text at the BOTTOM-LEFT corner
- *   – Approx 20% width × 2.5% height of image
+ *   ✦ sparkle icon — BOTTOM-RIGHT corner (same position as DALL-E)
+ *   AND sometimes a faint "Generated with Gemini" text — BOTTOM-CENTER or BOTTOM-LEFT
+ *   We cover both zones to be safe.
  */
 async function removeGeminiWatermark(inputBuffer, metadata) {
-    const wmW = Math.ceil(metadata.width  * 0.28); // wider for "Generated by Gemini" text
-    const wmH = Math.ceil(metadata.height * 0.032);
+    let buf = inputBuffer;
 
-    const left = 0;
-    const top  = metadata.height - wmH;
+    // Zone 1: Bottom-right sparkle (✦ icon)
+    const rightW = Math.ceil(metadata.width  * 0.15);
+    const rightH = Math.ceil(metadata.height * 0.10);
+    const rightL = metadata.width  - rightW;
+    const rightT = metadata.height - rightH;
 
-    return await inpaintRegion(inputBuffer, left, top, wmW, wmH);
+    await logRegionStats(buf, rightL, rightT, rightW, rightH, 'Gemini-BR');
+    buf = await inpaintRegion(buf, rightL, rightT, rightW, rightH);
+
+    // Zone 2: Bottom-left text ("Generated with Gemini")
+    const meta2 = await sharp(buf).metadata();
+    const leftW = Math.ceil(meta2.width  * 0.35);
+    const leftH = Math.ceil(meta2.height * 0.05);
+    const leftT = meta2.height - leftH;
+
+    await logRegionStats(buf, 0, leftT, leftW, leftH, 'Gemini-BL');
+    buf = await inpaintRegion(buf, 0, leftT, leftW, leftH);
+
+    return buf;
 }
 
 /**
- * Auto-detect: Try to detect which watermark is present.
- * Strategy: sample bottom-left and bottom-right pixel brightness.
- * A dark text watermark leaves detectable contrast vs background.
- * We apply both removals to be safe — removes both if present.
+ * Auto mode — removes BOTH ChatGPT and Gemini watermarks:
+ *   - Bottom-right corner (DALL-E ✦ / Gemini ✦)
+ *   - Bottom-left corner (Gemini text, if present)
  */
 async function removeAllWatermarks(inputBuffer, metadata) {
-    let buf = inputBuffer;
-    buf = await removeChatGPTWatermark(buf, metadata);
-    const freshMeta = await sharp(buf).metadata(); // re-read after first pass
-    buf = await removeGeminiWatermark(buf, freshMeta);
+    // Remove bottom-right sparkle (covers DALL-E & Gemini icon)
+    const rightW = Math.ceil(metadata.width  * 0.15);
+    const rightH = Math.ceil(metadata.height * 0.10);
+    const rightL = metadata.width  - rightW;
+    const rightT = metadata.height - rightH;
+
+    let buf = await inpaintRegion(inputBuffer, rightL, rightT, rightW, rightH);
+
+    // Remove bottom-left text watermark (Gemini text, if present)
+    const meta2 = await sharp(buf).metadata();
+    const leftW = Math.ceil(meta2.width  * 0.35);
+    const leftH = Math.ceil(meta2.height * 0.05);
+    const leftT = meta2.height - leftH;
+
+    buf = await inpaintRegion(buf, 0, leftT, leftW, leftH);
+
     return buf;
 }
 
@@ -147,43 +185,34 @@ const processImage = async (req, res) => {
         const inputBuffer = req.file.buffer;
         const metadata    = await sharp(inputBuffer).metadata();
 
-        // watermarkType: 'auto' | 'chatgpt' | 'gemini'  (sent from frontend)
-        const wmType = (req.body.watermarkType || 'auto').toLowerCase();
+        console.log(`Processing image: ${req.file.originalname} | ${metadata.width}x${metadata.height} | format: ${metadata.format}`);
 
-        let processedBuffer;
+        // watermarkType: 'auto' | 'chatgpt' | 'gemini'
+        const wmType = (req.body.watermarkType || 'auto').toLowerCase();
+        console.log(`Watermark type: ${wmType}`);
+
+        let cleaned;
 
         if (wmType === 'chatgpt') {
-            const cleaned = await removeChatGPTWatermark(inputBuffer, metadata);
-            processedBuffer = await sharp(cleaned)
-                .withMetadata()
-                .toFormat(metadata.format || 'png')
-                .toBuffer();
-
+            cleaned = await removeChatGPTWatermark(inputBuffer, metadata);
         } else if (wmType === 'gemini') {
-            const cleaned = await removeGeminiWatermark(inputBuffer, metadata);
-            processedBuffer = await sharp(cleaned)
-                .withMetadata()
-                .toFormat(metadata.format || 'png')
-                .toBuffer();
-
+            cleaned = await removeGeminiWatermark(inputBuffer, metadata);
         } else {
-            // Auto — remove both
-            const cleaned = await removeAllWatermarks(inputBuffer, metadata);
-            processedBuffer = await sharp(cleaned)
-                .withMetadata()
-                .toFormat(metadata.format || 'png')
-                .toBuffer();
+            // Auto — remove all known watermark zones
+            cleaned = await removeAllWatermarks(inputBuffer, metadata);
         }
 
-        // Save log to MongoDB gracefully
+        const processedBuffer = await sharp(cleaned)
+            .withMetadata()
+            .toFormat(metadata.format || 'png')
+            .toBuffer();
+
+        // Log to MongoDB gracefully
         try {
-            const newLog = new ImageLog({
-                originalName: req.file.originalname,
-                processedPath: 'in-memory'
-            });
+            const newLog = new ImageLog({ originalName: req.file.originalname, processedPath: 'in-memory' });
             await newLog.save();
         } catch (dbError) {
-            console.log('Could not save to MongoDB, skipping log:', dbError.message);
+            console.log('MongoDB log skipped:', dbError.message);
         }
 
         const mimeType = `image/${metadata.format || 'png'}`;
